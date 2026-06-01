@@ -49,3 +49,69 @@ def save_working_proxies(proxies_with_latency: List[Tuple[str, int]]):
 
   conn.commit()
   conn.close()
+
+
+def get_proxies() -> List[Tuple[str, int]]:
+  """
+  Returns a list of tuples in the format (ip, port)
+  """
+  conn = sqlite3.connect("proxies.db")
+  cursor = conn.cursor()
+
+  cursor.execute("SELECT * FROM proxies")
+  proxies = cursor.fetchall()
+
+
+  new_proxies = [f"{ip}:{port}" for _, ip, port, _, latency, *_ in proxies]
+
+  conn.close()
+  return new_proxies
+
+
+def remove_proxies(last_checked: str) -> Tuple[bool, int]:
+  """
+  Removes a list of not working proxies based on wether their last_checked was updated or not
+  """
+  conn = sqlite3.connect("proxies.db")
+  cursor = conn.cursor()
+
+  cursor.execute('''
+  DELETE FROM proxies WHERE last_checked != ?
+  ''', 
+  (last_checked,)
+  )
+
+  conn.commit()
+  deleted = cursor.rowcount
+
+  conn.close()
+
+  return (deleted > 0, deleted)
+
+
+def update_proxies(target: List[Tuple[str, int]]) -> Tuple[bool, int, str]:
+  """
+  Updates the proxies with the new latency returns (updated, count, last_checked)
+  """
+  conn = sqlite3.connect("proxies.db")
+  cursor = conn.cursor()
+
+  last_checked = datetime.now().isoformat()
+  data = [(latency, last_checked, proxy.split(":")[0], int(proxy.split(":")[1]))  for proxy, latency in target]
+
+  cursor.executemany(
+    '''
+    UPDATE proxies 
+    SET latency_ms = ?,
+        last_checked = ?
+    WHERE ip = ? AND port = ?
+    ''',
+    data
+  )
+
+  conn.commit()
+  updated = cursor.rowcount
+
+  conn.close()
+
+  return (updated > 0, len(target), last_checked)

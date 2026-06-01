@@ -1,6 +1,6 @@
 import aiohttp
 import asyncio
-from src.storage import init_db, save_working_proxies
+from src.storage import init_db, save_working_proxies, get_proxies, remove_proxies, update_proxies
 from src.ingest import scrape_source
 from src.sources import SOURCES
 from src.validation import validate_batch
@@ -33,6 +33,38 @@ async def main():
   save_working_proxies(all_working)
 
   print(f"\n[FINISHED] Working proxies: {len(all_working)}")
+
+
+
+
+async def revalidate_proxies():
+  """
+  Revalidates already stored proxies
+  """
+
+  proxies = get_proxies()
+  chunk_size = 500
+  all_working = []
+
+  print(f"[START] Proxy list: {len(proxies)} proxies")
+
+  for i in range(0, len(proxies), chunk_size):
+    chunk = proxies[i:i+chunk_size]
+    working = await validate_batch(chunk, concurrent=100)
+    all_working.extend(working)
+    print(f"[REVALIDATE] Chunk {i // chunk_size + 1}: Working {len(working)}")
+
+
+  # update the working proxies
+  _, count, last_checked = update_proxies(all_working)
+  print(f"[DB] Updated working proxies: {count}")
+
+  # remove not working proxies
+  _, count = remove_proxies(last_checked)
+  print(f"[DB] Removed dead proxies: {count}")
+
+  print(f"[FINISH] Working proxies: {len(all_working)}")
+
 
 
 if __name__ == "__main__":

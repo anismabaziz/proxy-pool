@@ -1,8 +1,7 @@
 import asyncio
-import aiohttp
-from typing import List
 import re
 
+import aiohttp
 
 
 async def fetch(session: aiohttp.ClientSession, url : str) -> str:
@@ -14,19 +13,24 @@ async def fetch(session: aiohttp.ClientSession, url : str) -> str:
   # sleep time is exponential
   for attemps in range(3):
     try:
-      async with session.get(url, headers=headers, timeout=10) as resp:
+      async with session.get(
+        url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+      ) as resp:
         if resp.status == 200:
           return await resp.text()
-        else:
-          return await asyncio.sleep(1)
-    except:
+    except:  # noqa: E722 - narrowed once fetch failures are handled one by one
       await asyncio.sleep(2 ** attemps)
+      continue
+
+    # an unsuccessful response: pause, then let the loop try again with the
+    # response closed rather than held open for the length of the pause
+    await asyncio.sleep(1)
 
   return ""
 
 
 
-async def extract(html: str, source_name: str) -> List[str]:
+async def extract(html: str, source_name: str) -> list[str]:
   """ Extract IP:PORT pattern from html or raw text """
 
   patterns = [
@@ -40,7 +44,7 @@ async def extract(html: str, source_name: str) -> List[str]:
   return list(set(matches))
 
 
-async def scrape_source(session: aiohttp.ClientSession, url: str, name: str) -> List[str]:
+async def scrape_source(session: aiohttp.ClientSession, url: str, name: str) -> list[str]:
   """ Main scraping function """
   html = await fetch(session, url)
   if not html:

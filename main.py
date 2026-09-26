@@ -1,15 +1,19 @@
-import aiohttp
 import asyncio
-from src.storage import init_db, save_working_proxies, get_proxies, remove_proxies, update_proxies
+
+import aiohttp
 from src.ingest import scrape_source
 from src.sources import SOURCES
+from src.storage import (
+  get_proxies,
+  init_db,
+  remove_proxies,
+  save_working_proxies,
+  update_proxies,
+)
 from src.validation import validate_batch
 
 
-
-
-
-async def scrape():
+async def scrape() -> None:
   init_db()
   all_found = []
 
@@ -54,7 +58,7 @@ async def scrape():
 
 
 
-async def revalidate_proxies():
+async def revalidate_proxies() -> None:
   """
   Revalidates already stored proxies
   """

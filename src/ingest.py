@@ -4,21 +4,23 @@ import re
 import aiohttp
 
 
-async def fetch(session: aiohttp.ClientSession, url: str) -> str:
-    """Fetch html from url with retry logic"""
+async def request(
+    session: aiohttp.ClientSession, url: str, user_agent: str, timeout_s: float
+) -> str:
+    """Get the text at url, retrying a few times before giving up"""
 
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    headers = {"User-Agent": user_agent}
 
     # at each attempt we try to get the url html if there is any problem we stop
     # sleep time is exponential
     for attemps in range(3):
         try:
             async with session.get(
-                url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_s)
             ) as resp:
                 if resp.status == 200:
                     return await resp.text()
-        except:  # noqa: E722 - narrowed once fetch failures are handled one by one
+        except:  # noqa: E722 - a source that keeps failing is treated as empty
             await asyncio.sleep(2**attemps)
             continue
 
@@ -29,7 +31,7 @@ async def fetch(session: aiohttp.ClientSession, url: str) -> str:
     return ""
 
 
-async def extract(html: str, source_name: str) -> list[str]:
+async def extract(html: str) -> list[str]:
     """Extract IP:PORT pattern from html or raw text"""
 
     patterns = [
@@ -41,17 +43,3 @@ async def extract(html: str, source_name: str) -> list[str]:
 
     # dedupe
     return list(set(matches))
-
-
-async def scrape_source(
-    session: aiohttp.ClientSession, url: str, name: str
-) -> list[str]:
-    """Main scraping function"""
-    html = await fetch(session, url)
-    if not html:
-        return []
-
-    proxies = await extract(html, url)
-    print(f"[✓] {name}: found {len(proxies)} proxies")
-
-    return proxies

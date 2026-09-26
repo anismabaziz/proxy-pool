@@ -1,8 +1,10 @@
 import sqlite3
 from datetime import datetime
 
+DEFAULT_DB_PATH = "proxies.db"
 
-def init_db(db_path: str = "proxies.db") -> None:
+
+def init_db(db_path: str = DEFAULT_DB_PATH) -> None:
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -25,9 +27,11 @@ def init_db(db_path: str = "proxies.db") -> None:
     conn.close()
 
 
-def save_working_proxies(proxies_with_latency: list[tuple[str, int]]) -> None:
+def save_working_proxies(
+    proxies_with_latency: list[tuple[str, int]], db_path: str = DEFAULT_DB_PATH
+) -> None:
 
-    conn = sqlite3.connect("proxies.db")
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
     now = datetime.now().isoformat()
 
@@ -53,11 +57,11 @@ def save_working_proxies(proxies_with_latency: list[tuple[str, int]]) -> None:
     conn.close()
 
 
-def get_proxies() -> list[str]:
+def get_proxies(db_path: str = DEFAULT_DB_PATH) -> list[str]:
     """
     Returns every stored proxy as an "ip:port" address
     """
-    conn = sqlite3.connect("proxies.db")
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     cursor.execute("SELECT * FROM proxies")
@@ -69,16 +73,18 @@ def get_proxies() -> list[str]:
     return new_proxies
 
 
-def remove_proxies(last_checked: str) -> tuple[bool, int]:
+def remove_proxies(
+    last_checked: str, db_path: str = DEFAULT_DB_PATH
+) -> tuple[bool, int]:
     """
     Removes every proxy that was not touched at last_checked
     """
-    conn = sqlite3.connect("proxies.db")
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     cursor.execute(
         """
-  DELETE FROM proxies WHERE last_checked != ?
+    DELETE FROM proxies WHERE last_checked != ?
   """,
         (last_checked,),
     )
@@ -91,11 +97,13 @@ def remove_proxies(last_checked: str) -> tuple[bool, int]:
     return (deleted > 0, deleted)
 
 
-def update_proxies(target: list[tuple[str, int]]) -> tuple[bool, int, str]:
+def update_proxies(
+    target: list[tuple[str, int]], db_path: str = DEFAULT_DB_PATH
+) -> tuple[bool, int, str]:
     """
     Updates the proxies with the new latency returns (updated, count, last_checked)
     """
-    conn = sqlite3.connect("proxies.db")
+    conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
     last_checked = datetime.now().isoformat()

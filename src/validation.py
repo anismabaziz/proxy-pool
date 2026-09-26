@@ -30,7 +30,7 @@ async def validate_batch(proxies: List[str], concurrent: int = 50) -> List[Tuple
   """ Validate a batch of proxies with concurrency control """
 
   # create a connector that accepts up ot x concurrent jobs
-  connector = aiohttp.TCPConnector(limit=concurrent, limit_per_host=10, ssl=False)
+  connector = aiohttp.TCPConnector(limit=concurrent, limit_per_host=10, ssl=False, ttl_dns_cache=300, force_close=False)
 
   # use the connector to spin up tasks of validation and run them concurrently
   async with aiohttp.ClientSession(connector=connector) as session:

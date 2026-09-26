@@ -5,10 +5,13 @@ from src.ingest import scrape_source
 from src.sources import SOURCES
 from src.validation import validate_batch
 
-async def main():
+
+
+
+
+async def scrape():
   init_db()
   all_found = []
-
 
   async with aiohttp.ClientSession() as session:
     # scrape all sources concurently
@@ -22,17 +25,31 @@ async def main():
   print(f"[RAW] Total unique proxies harvested: {len(unique_proxies)}")
 
   # validate chunks
-  chunk_size = 500
+  chunk_size = 300
   all_working = []
+
+  # add a max
+  unique_proxies = unique_proxies[:5000]
+
   for i in range(0, len(unique_proxies), chunk_size):
     chunk = unique_proxies[i:i+chunk_size]
-    working = await validate_batch(chunk, concurrent=100)
-    all_working.extend(working)
-    print(f"[VALID] Chunk {i // chunk_size + 1}: {len(working)} working")
+
+    await asyncio.sleep(2 + (i // chunk_size) * 0.5)
+
+    try:
+      working = await validate_batch(chunk, concurrent=25)
+      all_working.extend(working)
+      print(f"[VALID] Chunk {i // chunk_size + 1}: Working {len(working)}")
+
+    except Exception as e:
+        print(f"[ERROR] Chunk failed: {e}")
+        await asyncio.sleep(10)
 
   save_working_proxies(all_working)
+  print(f"\n[DB] Saved proxies to db: {len(all_working)}")
 
-  print(f"\n[FINISHED] Working proxies: {len(all_working)}")
+
+  print(f"\n[FINISH] Working proxies: {len(all_working)}")
 
 
 
@@ -43,16 +60,25 @@ async def revalidate_proxies():
   """
 
   proxies = get_proxies()
-  chunk_size = 500
+  chunk_size = 300
   all_working = []
 
   print(f"[START] Proxy list: {len(proxies)} proxies")
 
   for i in range(0, len(proxies), chunk_size):
     chunk = proxies[i:i+chunk_size]
-    working = await validate_batch(chunk, concurrent=100)
-    all_working.extend(working)
-    print(f"[REVALIDATE] Chunk {i // chunk_size + 1}: Working {len(working)}")
+
+    await asyncio.sleep(2 + (i // chunk_size) * 0.5)
+
+    try:
+      working = await validate_batch(chunk, concurrent=25)
+      all_working.extend(working)
+      print(f"[REVALIDATE] Chunk {i // chunk_size + 1}: Working {len(working)}")
+
+    except Exception as e:
+        print(f"[ERROR] Chunk failed: {e}")
+        await asyncio.sleep(10)
+
 
 
   # update the working proxies
@@ -68,6 +94,6 @@ async def revalidate_proxies():
 
 
 if __name__ == "__main__":
-  asyncio.run(main())
+  asyncio.run(scrape())
 
 

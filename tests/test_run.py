@@ -1,3 +1,4 @@
+import json
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -5,7 +6,7 @@ from pathlib import Path
 import pytest
 from src.capabilities import Payload, ProbeOutcome
 from src.run import RunSettings, revalidate, run
-from src.sources import Source
+from src.sources import EmptySourceError, PayloadFormat, Source
 from src.storage import get_proxies, init_db, save_working_proxies
 
 
@@ -55,15 +56,16 @@ def pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     yield tmp_path / "proxies.db"
 
 
+def text_source(name: str) -> Source:
+    return Source(name, f"https://{name}.example", PayloadFormat.ADDRESS_LIST)
+
+
 def sources() -> tuple[Source, ...]:
-    return (
-        Source("first", "https://first.example"),
-        Source("second", "https://second.example"),
-    )
+    return text_source("first"), text_source("second")
 
 
 async def test_every_source_is_fetched(pool: Path) -> None:
-    fetcher = FakeFetcher({"first": "1.1.1.1:80\n2.2.2.2:80"})
+    fetcher = FakeFetcher({"first": "1.1.1.1:80\n2.2.2.2:80", "second": "3.3.3.3:80"})
 
     await run(run_settings(sources()), fetcher, FakeProbe(working=set()))
 
@@ -82,7 +84,7 @@ async def test_only_candidates_reaching_the_probe_are_probed(pool: Path) -> None
     report = await run(run_settings(sources()), fetcher, probe)
 
     assert sorted(probe.asked) == ["1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"]
-    assert report.harvested == 3
+    assert report.scraped == 3
     assert report.candidates == 3
     assert report.probed == 3
 
@@ -102,7 +104,12 @@ async def test_a_probe_failure_costs_the_whole_chunk(pool: Path) -> None:
             self.asked.append(candidate)
             raise RuntimeError("connection reset")
 
-    fetcher = FakeFetcher({"first": "1.1.1.1:80\n2.2.2.2:80"})
+    fetcher = FakeFetcher(
+        {
+            "first": "1.1.1.1:80\n2.2.2.2:80",
+            "second": "1.1.1.1:80\n2.2.2.2:80",
+        }
+    )
     probe = ExplodingProbe(working=set())
 
     report = await run(run_settings(sources()), fetcher, probe)
@@ -112,7 +119,12 @@ async def test_a_probe_failure_costs_the_whole_chunk(pool: Path) -> None:
 
 
 async def test_working_proxies_are_saved(pool: Path) -> None:
-    fetcher = FakeFetcher({"first": "1.1.1.1:80\n2.2.2.2:80"})
+    fetcher = FakeFetcher(
+        {
+            "first": "1.1.1.1:80\n2.2.2.2:80",
+            "second": "1.1.1.1:80\n2.2.2.2:80",
+        }
+    )
 
     report = await run(
         run_settings(sources()), fetcher, FakeProbe(working={"1.1.1.1:80"})
@@ -134,3 +146,91 @@ async def test_revalidation_drops_the_proxies_that_stopped_working(pool: Path) -
     assert report.updated == 1
     assert report.removed == 1
     assert get_proxies() == ["1.1.1.1:80"]
+
+
+GEONODE_PAYLOAD = json.dumps(
+    {
+        "data": [
+            {"ip": "1.1.1.1", "port": "8080", "protocols": ["http"]},
+            {"ip": "2.2.2.2", "port": "3128", "protocols": ["http"]},
+        ],
+        "total": 2,
+    }
+)
+
+
+async def test_a_json_source_offers_the_addresses_it_splits_into_fields(
+    pool: Path,
+) -> None:
+    source = Source("geonode", "https://geonode.example", PayloadFormat.GEONODE_JSON)
+    fetcher = FakeFetcher({"geonode": GEONODE_PAYLOAD})
+    probe = FakeProbe(working=set())
+
+    report = await run(run_settings((source,)), fetcher, probe)
+
+    assert sorted(probe.asked) == ["1.1.1.1:8080", "2.2.2.2:3128"]
+    assert report.scraped == 2
+
+
+async def test_a_source_that_offers_nothing_is_an_error(pool: Path) -> None:
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "no addresses in here"})
+
+    with pytest.raises(EmptySourceError, match="second"):
+        await run(run_settings(sources()), fetcher, FakeProbe(working=set()))
+
+
+async def test_a_json_source_without_entries_is_an_error(pool: Path) -> None:
+    source = Source("geonode", "https://geonode.example", PayloadFormat.GEONODE_JSON)
+    fetcher = FakeFetcher({"geonode": json.dumps({"data": []})})
+
+    with pytest.raises(EmptySourceError, match="geonode"):
+        await run(run_settings((source,)), fetcher, FakeProbe(working=set()))
+
+
+async def test_a_json_source_answering_with_an_error_page_is_an_error(
+    pool: Path,
+) -> None:
+    source = Source("geonode", "https://geonode.example", PayloadFormat.GEONODE_JSON)
+    fetcher = FakeFetcher({"geonode": "<html><body>502 Bad Gateway</body></html>"})
+
+    with pytest.raises(EmptySourceError, match="geonode"):
+        await run(run_settings((source,)), fetcher, FakeProbe(working=set()))
+
+
+async def test_a_run_reports_what_each_source_contributed(pool: Path) -> None:
+    fetcher = FakeFetcher(
+        {
+            "first": "1.1.1.1:80\n2.2.2.2:80",
+            "second": "2.2.2.2:80\n3.3.3.3:80",
+        }
+    )
+
+    report = await run(run_settings(sources()), fetcher, FakeProbe(working=set()))
+
+    assert [(c.source, c.candidates) for c in report.contributions] == [
+        ("first", 2),
+        ("second", 2),
+    ]
+
+
+async def test_a_long_source_cannot_crowd_out_a_short_one(pool: Path) -> None:
+    fetcher = FakeFetcher(
+        {
+            "first": "".join(f"1.1.1.{n}:80\n" for n in range(10)),
+            "second": "9.9.9.9:80\n",
+        }
+    )
+    probe = FakeProbe(working=set())
+    settings = RunSettings(
+        sources=sources(),
+        db_path="proxies.db",
+        max_candidates=2,
+        chunk_size=10,
+        chunk_delay_base=0,
+        chunk_delay_step=0,
+        failure_delay=0,
+    )
+
+    await run(settings, fetcher, probe)
+
+    assert probe.asked == ["1.1.1.0:80", "9.9.9.9:80"]

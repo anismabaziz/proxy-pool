@@ -1,9 +1,9 @@
 import asyncio
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from itertools import zip_longest
 
 from src.capabilities import Fetcher, ProbeOutcome, Prober
-from src.ingest import extract
 from src.sources import SOURCES, Source
 from src.storage import (
     DEFAULT_DB_PATH,
@@ -36,14 +36,24 @@ class RunSettings:
     failure_delay: float = 10
 
 
+@dataclass(frozen=True)
+class SourceContribution:
+    """What one source offered a run"""
+
+    source: str
+    payload_format: str
+    candidates: int
+
+
 @dataclass
 class RunReport:
     """What a full scrape run found"""
 
-    harvested: int
+    scraped: int
     candidates: int
     probed: int
     failed_chunks: int
+    contributions: tuple[SourceContribution, ...] = ()
     working: list[ProbeOutcome] = field(default_factory=list)
     saved: int = 0
 
@@ -68,6 +78,35 @@ def addresses(outcomes: Sequence[ProbeOutcome]) -> list[tuple[str, int]]:
 def chunks(candidates: Sequence[str], size: int) -> Iterable[Sequence[str]]:
     for start in range(0, len(candidates), size):
         yield candidates[start : start + size]
+
+
+def take_turns(per_source: Sequence[Sequence[str]]) -> list[str]:
+    """Every source's candidates, drawn in turn, so a source with a long list
+    cannot fill the whole budget and leave the rest unrepresented"""
+
+    return [
+        candidate
+        for turn in zip_longest(*per_source, fillvalue=None)
+        for candidate in turn
+        if candidate is not None
+    ]
+
+
+async def scrape_sources(
+    sources: Sequence[Source], fetcher: Fetcher
+) -> list[tuple[Source, list[str]]]:
+    """Read every source in its own declared format, and return what each offered"""
+
+    payloads = await asyncio.gather(*(fetcher.fetch(s) for s in sources))
+
+    scraped: list[tuple[Source, list[str]]] = []
+
+    for source, payload in zip(sources, payloads, strict=True):
+        candidates = source.scrape(payload.text)
+        scraped.append((source, candidates))
+        print(f"[✓] {source.name}: found {len(candidates)} candidates")
+
+    return scraped
 
 
 async def probe_in_chunks(
@@ -106,16 +145,10 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
 
     init_db(settings.db_path)
 
-    payloads = await asyncio.gather(*(fetcher.fetch(s) for s in settings.sources))
+    scraped = await scrape_sources(settings.sources, fetcher)
 
-    harvested: list[str] = []
-    for payload in payloads:
-        proxies = await extract(payload.text)
-        print(f"[✓] {payload.source}: found {len(proxies)} proxies")
-        harvested.extend(proxies)
-
-    unique = list(set(harvested))
-    print(f"[RAW] Total unique proxies harvested: {len(unique)}")
+    unique = list(dict.fromkeys(take_turns([found for _, found in scraped])))
+    print(f"[RAW] Total unique candidates scraped: {len(unique)}")
 
     candidates = unique[: settings.max_candidates]
     working, failed_chunks = await probe_in_chunks(
@@ -127,10 +160,18 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
     print(f"\n[FINISH] Working proxies: {len(working)}")
 
     return RunReport(
-        harvested=len(unique),
+        scraped=len(unique),
         candidates=len(candidates),
         probed=len(candidates),
         failed_chunks=failed_chunks,
+        contributions=tuple(
+            SourceContribution(
+                source=source.name,
+                payload_format=source.payload_format.value,
+                candidates=len(found),
+            )
+            for source, found in scraped
+        ),
         working=working,
         saved=len(working),
     )

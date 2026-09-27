@@ -1,9 +1,21 @@
 [project]
 name = "proxy-scraper"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scrape public proxy lists, probe what comes back, and keep the pool honest."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Anis Mabaziz" }]
+keywords = [
+    "proxy",
+    "proxy-scraper",
+    "asyncio",
+    "aiohttp",
+    "http",
+    "scraping",
+    "networking",
+]
 dependencies = [
     "aiohttp>=3.13.5",
 ]

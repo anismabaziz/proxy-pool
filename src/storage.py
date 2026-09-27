@@ -36,7 +36,8 @@ def save_working_proxies(
     now = datetime.now().isoformat()
 
     for proxy, latency in proxies_with_latency:
-        ip, port = proxy.split(":")
+        address, port = proxy.split(":")
+        record = (address, int(port), latency, now)
 
         try:
             cursor.execute(
@@ -47,10 +48,10 @@ def save_working_proxies(
           latency_ms = EXCLUDED.latency_ms,
           last_checked = EXCLUDED.last_checked
       """,
-                (ip, int(port), latency, now),
+                record,
             )
 
-        except Exception as e:
+        except sqlite3.Error as e:
             print(f"DB error on {proxy}: {e}")
 
     conn.commit()

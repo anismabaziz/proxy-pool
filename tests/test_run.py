@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from src.capabilities import Payload, ProbeOutcome
+from src.capabilities import Outcome, Payload, ProbeOutcome
 from src.run import RunSettings, revalidate, run
 from src.sources import EmptySourceError, PayloadFormat, Source
 from src.storage import get_proxies, init_db, save_working_proxies
@@ -24,14 +24,21 @@ class FakeFetcher:
 class FakeProbe:
     working: set[str]
     latency_ms: int = 100
+    otherwise: dict[str, Outcome] = field(default_factory=dict)
     asked: list[str] = field(default_factory=list)
 
     async def probe(self, candidate: str) -> ProbeOutcome:
         self.asked.append(candidate)
+        state = (
+            Outcome.WORKING
+            if candidate in self.working
+            else self.otherwise.get(candidate, Outcome.UNREACHABLE)
+        )
+
         return ProbeOutcome(
             proxy=candidate,
-            latency_ms=self.latency_ms if candidate in self.working else 0,
-            is_working=candidate in self.working,
+            state=state,
+            latency_ms=self.latency_ms if state is Outcome.WORKING else None,
         )
 
 
@@ -234,3 +241,33 @@ async def test_a_long_source_cannot_crowd_out_a_short_one(pool: Path) -> None:
     await run(settings, fetcher, probe)
 
     assert probe.asked == ["1.1.1.0:80", "9.9.9.9:80"]
+
+
+async def test_a_candidate_answering_with_the_wrong_body_stays_out_of_the_pool(
+    pool: Path,
+) -> None:
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "2.2.2.2:80"})
+    probe = FakeProbe(
+        working={"2.2.2.2:80"}, otherwise={"1.1.1.1:80": Outcome.REJECTED}
+    )
+
+    report = await run(run_settings(sources()), fetcher, probe)
+
+    assert [outcome.proxy for outcome in report.working] == ["2.2.2.2:80"]
+    assert get_proxies() == ["2.2.2.2:80"]
+
+
+async def test_an_unreachable_candidate_stays_out_of_the_pool(pool: Path) -> None:
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "2.2.2.2:80"})
+    probe = FakeProbe(
+        working={"2.2.2.2:80"}, otherwise={"1.1.1.1:80": Outcome.UNREACHABLE}
+    )
+
+    report = await run(run_settings(sources()), fetcher, probe)
+
+    assert [outcome.proxy for outcome in report.working] == ["2.2.2.2:80"]
+    assert get_proxies() == ["2.2.2.2:80"]
+
+
+def test_the_default_validation_target_is_https() -> None:
+    assert RunSettings().validation_target.startswith("https://")

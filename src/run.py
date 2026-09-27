@@ -16,6 +16,11 @@ from src.storage import (
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
 
+# an HTTPS endpoint that answers with the caller's own address as bare text, so
+# that carrying the request is something we can see in the body rather than
+# something we take on trust from a status code
+DEFAULT_VALIDATION_TARGET = "https://api.ipify.org"
+
 
 @dataclass(frozen=True)
 class RunSettings:
@@ -23,7 +28,7 @@ class RunSettings:
 
     sources: tuple[Source, ...] = SOURCES
     db_path: str = DEFAULT_DB_PATH
-    probe_url: str = "http://httpbin.org/ip"
+    validation_target: str = DEFAULT_VALIDATION_TARGET
     user_agent: str = DEFAULT_USER_AGENT
     max_candidates: int = 5000
     chunk_size: int = 300
@@ -70,9 +75,9 @@ class RevalidationReport:
 
 
 def addresses(outcomes: Sequence[ProbeOutcome]) -> list[tuple[str, int]]:
-    """The working outcomes as the "ip:port, latency" pairs storage stores"""
+    """The "ip:port, latency" pairs storage keeps, one per working outcome"""
 
-    return [(outcome.proxy, outcome.latency_ms) for outcome in outcomes]
+    return [pair for outcome in outcomes if (pair := outcome.as_pair()) is not None]
 
 
 def chunks(candidates: Sequence[str], size: int) -> Iterable[Sequence[str]]:

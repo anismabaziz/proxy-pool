@@ -31,7 +31,7 @@ async def scrape(settings: RunSettings | None = None) -> RunReport:
 
         async with probing_session(settings) as probe_session:
             prober = HttpProber(
-                probe_session, settings.probe_url, settings.probe_timeout
+                probe_session, settings.validation_target, settings.probe_timeout
             )
 
             return await run(settings, fetcher, prober)
@@ -43,7 +43,7 @@ async def revalidate_stored(settings: RunSettings | None = None) -> Revalidation
     settings = settings or RunSettings()
 
     async with probing_session(settings) as session:
-        prober = HttpProber(session, settings.probe_url, settings.probe_timeout)
+        prober = HttpProber(session, settings.validation_target, settings.probe_timeout)
 
         return await revalidate(settings, prober)
 

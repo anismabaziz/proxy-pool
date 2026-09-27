@@ -28,11 +28,11 @@ class HttpProber:
     """Probe a candidate over HTTP"""
 
     def __init__(
-        self, session: aiohttp.ClientSession, test_url: str, timeout_s: float
+        self, session: aiohttp.ClientSession, target_url: str, timeout_s: float
     ) -> None:
         self._session = session
-        self._test_url = test_url
+        self._target_url = target_url
         self._timeout_s = timeout_s
 
     async def probe(self, candidate: str) -> ProbeOutcome:
-        return await probe(self._session, candidate, self._test_url, self._timeout_s)
+        return await probe(self._session, candidate, self._target_url, self._timeout_s)

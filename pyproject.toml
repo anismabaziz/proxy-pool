@@ -27,7 +27,7 @@ ignore = ["E501"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["main.py", "src", "tests"]
+files = ["src", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

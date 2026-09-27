@@ -2,17 +2,21 @@ import asyncio
 
 import aiohttp
 
-ATTEMPTS = 3
-
 
 async def request(
-    session: aiohttp.ClientSession, url: str, user_agent: str, timeout_s: float
+    session: aiohttp.ClientSession,
+    url: str,
+    user_agent: str,
+    timeout_s: float,
+    attempts: int,
+    backoff_s: float,
 ) -> str:
-    """Get the text at url, retrying a few times before giving up"""
+    """Get the text at url, retrying as many times as we are given before giving
+    up on it"""
 
     headers = {"User-Agent": user_agent}
 
-    for attempt in range(ATTEMPTS):
+    for attempt in range(attempts):
         try:
             async with session.get(
                 url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_s)
@@ -24,9 +28,9 @@ async def request(
             # what it dropped us is of no use now that we are about to try again
             pass
 
-        if attempt < ATTEMPTS - 1:
+        if attempt < attempts - 1:
             # an unsuccessful response or a dropped one: pause before trying
             # again, longer each time, with the response already closed
-            await asyncio.sleep(2**attempt)
+            await asyncio.sleep(backoff_s * 2**attempt)
 
     return ""

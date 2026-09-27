@@ -4,7 +4,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from itertools import zip_longest
 
-from src.capabilities import Fetcher, ProbeOutcome, Prober
+from src.capabilities import Fetcher, Outcome, ProbeOutcome, Prober
+from src.logs import get_logger
 from src.sources import SOURCES, Source
 from src.storage import (
     DEFAULT_DB_PATH,
@@ -36,10 +37,14 @@ class RunSettings:
     connector_limit: int = 25
     connector_limit_per_host: int = 10
     fetch_timeout: float = 10
+    fetch_attempts: int = 3
+    fetch_backoff_seconds: float = 2
+    dns_cache_seconds: int = 300
     probe_timeout: float = 5
     chunk_delay_base: float = 2
     chunk_delay_step: float = 0.5
     failure_delay: float = 10
+    verbosity: int = 0
 
 
 @dataclass(frozen=True)
@@ -109,9 +114,11 @@ def apply_retention(outcomes: Sequence[ProbeOutcome], db_path: str) -> Retention
 def report_retention(retention: Retention) -> None:
     """What the pool's rules did, in the words a run uses to describe itself"""
 
-    print(f"[POOL] Working: {len(retention.working)}")
-    print(f"[POOL] Left on three strikes: {retention.evicted}")
-    print(f"[POOL] Left unprobed: {retention.stale}")
+    pool = get_logger("POOL")
+
+    pool.info("Working: %d", len(retention.working))
+    pool.info("Left on three strikes: %d", retention.evicted)
+    pool.info("Left unprobed: %d", retention.stale)
 
 
 def chunks(candidates: Sequence[str], size: int) -> Iterable[Sequence[str]]:
@@ -138,12 +145,14 @@ async def scrape_sources(
 
     payloads = await asyncio.gather(*(fetcher.fetch(s) for s in sources))
 
+    scraped_tag = get_logger("SCRAPED")
     scraped: list[tuple[Source, list[str]]] = []
 
     for source, payload in zip(sources, payloads, strict=True):
+        scraped_tag.debug("Reading %s", source.url)
         candidates = source.scrape(payload.text)
         scraped.append((source, candidates))
-        print(f"[✓] {source.name}: found {len(candidates)} candidates")
+        scraped_tag.info("%s: found %d candidates", source.name, len(candidates))
 
     return scraped
 
@@ -160,6 +169,13 @@ async def probe_in_chunks(
 
     outcomes: list[ProbeOutcome] = []
     failed_chunks = 0
+    tag = get_logger(label)
+    tag.debug(
+        "Probing %d candidates, %d at a time, against %s",
+        len(candidates),
+        settings.chunk_size,
+        settings.validation_target,
+    )
 
     for index, chunk in enumerate(chunks(candidates, settings.chunk_size)):
         await asyncio.sleep(
@@ -168,15 +184,26 @@ async def probe_in_chunks(
 
         try:
             chunk_outcomes = await asyncio.gather(*(prober.probe(c) for c in chunk))
-        except Exception as e:
-            print(f"[ERROR] Chunk failed: {e}")
+        except Exception as failure:
+            # a chunk that blew up says nothing about the candidates in it, so
+            # they are left unprobed rather than counted as misses
+            tag.error("Chunk %d failed: %s", index + 1, failure)
             failed_chunks += 1
             await asyncio.sleep(settings.failure_delay)
             continue
 
         outcomes.extend(chunk_outcomes)
         working = sum(1 for outcome in chunk_outcomes if outcome.is_working)
-        print(f"[{label}] Chunk {index + 1}: Working {working}")
+        tag.info("Chunk %d: Working %d of %d", index + 1, working, len(chunk_outcomes))
+        tag.debug(
+            "Unreachable: %s",
+            ", ".join(
+                outcome.proxy
+                for outcome in chunk_outcomes
+                if outcome.state is Outcome.UNREACHABLE
+            )
+            or "none",
+        )
 
     return outcomes, failed_chunks
 
@@ -189,7 +216,7 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
     scraped = await scrape_sources(settings.sources, fetcher)
 
     unique = list(dict.fromkeys(take_turns([found for _, found in scraped])))
-    print(f"[RAW] Total unique candidates scraped: {len(unique)}")
+    get_logger("RAW").info("Total unique candidates scraped: %d", len(unique))
 
     candidates = unique[: settings.max_candidates]
     outcomes, failed_chunks = await probe_in_chunks(
@@ -198,7 +225,7 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
     retention = apply_retention(outcomes, settings.db_path)
     report_retention(retention)
 
-    print(f"[FINISH] Probed {len(candidates)} candidates")
+    get_logger("FINISH").info("Probed %d candidates", len(candidates))
 
     return RunReport(
         scraped=len(unique),
@@ -227,7 +254,7 @@ async def revalidate(settings: RunSettings, prober: Prober) -> RevalidationRepor
     init_db(settings.db_path)
 
     stored = get_proxies(settings.db_path)
-    print(f"[START] Proxy list: {len(stored)} proxies")
+    get_logger("START").info("Pool holds %d candidates", len(stored))
 
     outcomes, failed_chunks = await probe_in_chunks(
         prober, stored, settings, "REVALIDATE"
@@ -235,7 +262,7 @@ async def revalidate(settings: RunSettings, prober: Prober) -> RevalidationRepor
     retention = apply_retention(outcomes, settings.db_path)
     report_retention(retention)
 
-    print(f"[FINISH] Revalidated {len(stored)} candidates")
+    get_logger("FINISH").info("Revalidated %d candidates", len(stored))
 
     return RevalidationReport(
         candidates=len(stored),

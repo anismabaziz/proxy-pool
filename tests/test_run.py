@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 from contextlib import closing
@@ -117,6 +118,22 @@ async def test_a_probe_failure_costs_the_whole_chunk(pool: Path) -> None:
 
     assert report.failed_chunks == 1
     assert report.working == []
+
+
+async def test_an_interrupted_run_is_not_swallowed(pool: Path) -> None:
+    """A cancellation is an answer, not a failure to swallow: a run that takes
+    one stops rather than carrying on with half its chunks"""
+
+    class InterruptedProbe(FakeProbe):
+        async def probe(self, candidate: str) -> ProbeOutcome:
+            raise asyncio.CancelledError
+
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "2.2.2.2:80"})
+
+    with pytest.raises(asyncio.CancelledError):
+        await run(
+            run_settings(sources(), pool), fetcher, InterruptedProbe(working=set())
+        )
 
 
 async def test_working_proxies_are_saved(pool: Path) -> None:

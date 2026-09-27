@@ -1,5 +1,5 @@
 [project]
-name = "proxy-scraper"
+name = "proxy-pool"
 version = "0.1.0"
 description = "Scrape public proxy lists, probe what comes back, and keep the pool honest."
 readme = "README.md"
@@ -9,7 +9,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "Anis Mabaziz" }]
 keywords = [
     "proxy",
-    "proxy-scraper",
+    "proxy-pool",
     "asyncio",
     "aiohttp",
     "http",

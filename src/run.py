@@ -1,4 +1,5 @@
 import asyncio
+from collections import Counter
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -9,10 +10,13 @@ from src.logs import get_logger
 from src.sources import SOURCES, Source
 from src.storage import (
     DEFAULT_DB_PATH,
+    RunRecord,
+    SourceYield,
     drop_stale,
     get_proxies,
     init_db,
     record_outcome,
+    record_run,
     stale_before,
 )
 
@@ -126,16 +130,75 @@ def chunks(candidates: Sequence[str], size: int) -> Iterable[Sequence[str]]:
         yield candidates[start : start + size]
 
 
-def take_turns(per_source: Sequence[Sequence[str]]) -> list[str]:
+def take_turns[T](per_source: Sequence[Sequence[T]]) -> list[T]:
     """Every source's candidates, drawn in turn, so a source with a long list
     cannot fill the whole budget and leave the rest unrepresented"""
 
     return [
-        candidate
+        item
         for turn in zip_longest(*per_source, fillvalue=None)
-        for candidate in turn
-        if candidate is not None
+        for item in turn
+        if item is not None
     ]
+
+
+def source_yields(
+    scraped: Sequence[tuple[Source, list[str]]],
+    outcomes: Sequence[ProbeOutcome],
+) -> tuple[SourceYield, ...]:
+    """What each source was responsible for, in the run that measured it. The
+    candidates are drawn in the order the run probes them in, and a candidate two
+    sources offered is counted once, against the source that got there first: a
+    duplicate is not a second contribution, and counting it as one is what made a
+    comparison between sources drawn from overlapping lists misleading. A source
+    whose every candidate another source also offered is in the answer with
+    nothing to its name, because it answered and had nothing that was its own"""
+
+    owner: dict[str, str] = {}
+
+    for source_name, candidate in take_turns(
+        [[(source.name, candidate) for candidate in found] for source, found in scraped]
+    ):
+        owner.setdefault(candidate, source_name)
+
+    worked = {outcome.proxy for outcome in outcomes if outcome.is_working}
+
+    # the order the sources were scraped in, so the answer reads the way the run
+    # was configured rather than in whatever order the work happened to finish
+    return tuple(
+        SourceYield(
+            source=source.name,
+            candidates=sum(1 for held in owner.values() if held == source.name),
+            working=sum(
+                1
+                for candidate, held in owner.items()
+                if held == source.name and candidate in worked
+            ),
+        )
+        for source, _ in scraped
+    )
+
+
+def run_record(
+    started_at: datetime,
+    scraped: int,
+    candidates: int,
+    outcomes: Sequence[ProbeOutcome],
+    contributions: tuple[SourceYield, ...],
+) -> RunRecord:
+    """What a run found, in the shape the pool keeps it in"""
+
+    states = Counter(outcome.state for outcome in outcomes)
+
+    return RunRecord(
+        started_at=started_at,
+        scraped=scraped,
+        candidates=candidates,
+        working=states[Outcome.WORKING],
+        unreachable=states[Outcome.UNREACHABLE],
+        rejected=states[Outcome.REJECTED],
+        contributions=contributions,
+    )
 
 
 async def scrape_sources(
@@ -212,6 +275,7 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
     """Fetch every source, probe what came back, and store what still works"""
 
     init_db(settings.db_path)
+    started_at = datetime.now()
 
     scraped = await scrape_sources(settings.sources, fetcher)
 
@@ -224,6 +288,20 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
     )
     retention = apply_retention(outcomes, settings.db_path)
     report_retention(retention)
+
+    # the row goes down only once the run is over, since a run that fell over
+    # measured nothing and a row claiming otherwise would be a finding the tool
+    # never made
+    record_run(
+        run_record(
+            started_at=started_at,
+            scraped=len(unique),
+            candidates=len(candidates),
+            outcomes=outcomes,
+            contributions=source_yields(scraped, outcomes),
+        ),
+        settings.db_path,
+    )
 
     get_logger("FINISH").info("Probed %d candidates", len(candidates))
 
@@ -252,6 +330,12 @@ async def revalidate(settings: RunSettings, prober: Prober) -> RevalidationRepor
     according to what the probe found"""
 
     init_db(settings.db_path)
+    started_at = datetime.now()
+
+    # a candidate no recent run probed goes before the run rather than in it: it
+    # is not data, and a run that measured it would be reporting on a row it had
+    # already stopped trusting
+    untrusted = drop_stale(stale_before(started_at), settings.db_path)
 
     stored = get_proxies(settings.db_path)
     get_logger("START").info("Pool holds %d candidates", len(stored))
@@ -262,6 +346,17 @@ async def revalidate(settings: RunSettings, prober: Prober) -> RevalidationRepor
     retention = apply_retention(outcomes, settings.db_path)
     report_retention(retention)
 
+    record_run(
+        run_record(
+            started_at=started_at,
+            scraped=0,
+            candidates=len(stored),
+            outcomes=outcomes,
+            contributions=(),
+        ),
+        settings.db_path,
+    )
+
     get_logger("FINISH").info("Revalidated %d candidates", len(stored))
 
     return RevalidationReport(
@@ -269,6 +364,6 @@ async def revalidate(settings: RunSettings, prober: Prober) -> RevalidationRepor
         failed_chunks=failed_chunks,
         updated=len(retention.working),
         evicted=retention.evicted,
-        stale=retention.stale,
+        stale=untrusted + retention.stale,
         working=retention.working,
     )

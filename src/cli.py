@@ -12,7 +12,9 @@ import aiohttp
 from src import run as pipeline
 from src.http import HttpFetcher, HttpProber, probing_session
 from src.logs import configure, get_logger
+from src.report import HistoryReport, read_history, render_markdown
 from src.run import RevalidationReport, RunReport, RunSettings
+from src.sources import SOURCES
 
 # a run that did what it was asked is a success, one that could not finish is a
 # failure, one that was asked for nothing is a usage error, and one that was cut
@@ -22,7 +24,7 @@ EXIT_FAILED = 1
 EXIT_USAGE = 2
 EXIT_INTERRUPTED = 130
 
-type Report = RunReport | RevalidationReport
+type Report = RunReport | RevalidationReport | HistoryReport
 type Command = Callable[[RunSettings], Coroutine[Any, Any, Report]]
 type Runner = Callable[[Command, RunSettings], Report]
 
@@ -147,12 +149,23 @@ async def revalidate(settings: RunSettings) -> RevalidationReport:
         return await pipeline.revalidate(settings, HttpProber(probing, settings))
 
 
+async def report(settings: RunSettings) -> HistoryReport:
+    """Read back what the runs so far recorded, with every source the tool knows
+    about in the answer so a source that stopped answering is visible"""
+
+    return read_history(settings.db_path, tuple(source.name for source in SOURCES))
+
+
 # the runs a command line can name, and what each one is for
 SUBCOMMANDS: dict[str, tuple[Command, str]] = {
     "scrape": (scrape, "fetch every source and probe what it offered"),
     "revalidate": (
         revalidate,
         "probe the pool that already exists and let each candidate in or out",
+    ),
+    "report": (
+        report,
+        "read the runs recorded so far back as hit rate, yield, and survival",
     ),
 }
 
@@ -235,6 +248,16 @@ def settings_from_args(args: argparse.Namespace) -> RunSettings:
     )
 
 
+def present(outcome: Report) -> None:
+    """What a subcommand has to say for itself. A run speaks through the log,
+    where a line can be filtered or silenced; the report is the answer to a
+    question, so it goes to stdout where it can be read, piped, or redirected
+    into a document"""
+
+    if isinstance(outcome, HistoryReport):
+        print(render_markdown(outcome))
+
+
 def main(argv: list[str] | None = None, execute: Runner = run_command) -> int:
     """What the tool was asked to do, and what it did about it"""
 
@@ -252,7 +275,7 @@ def main(argv: list[str] | None = None, execute: Runner = run_command) -> int:
     logger = get_logger("FINISH")
 
     try:
-        execute(args.command, settings)
+        present(execute(args.command, settings))
     except KeyboardInterrupt:
         logger.warning("Interrupted before the run finished")
         return EXIT_INTERRUPTED

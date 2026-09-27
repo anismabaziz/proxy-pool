@@ -7,10 +7,16 @@ from src.capabilities import Outcome, ProbeOutcome
 from src.storage import (
     SCHEMA_VERSION,
     STRIKE_LIMIT,
+    Lifetime,
+    RunRecord,
+    SourceYield,
     drop_stale,
     get_proxies,
     init_db,
+    read_lifetimes,
+    read_runs,
     record_outcome,
+    record_run,
     schema_version,
 )
 
@@ -67,6 +73,15 @@ def pooled(db_path: Path, column: str, address: str) -> object:
 
     assert found is not None, f"{address} is not in the pool"
     return found[0]
+
+
+def started_working(db_path: Path, address: str) -> str:
+    """When the pool first recorded a candidate as working"""
+
+    recorded = pooled(db_path, "first_working_at", address)
+    assert isinstance(recorded, str)
+
+    return recorded
 
 
 def test_saved_proxies_come_back_as_addresses(pool: Path) -> None:
@@ -301,3 +316,166 @@ def test_carrying_a_pool_across_twice_changes_nothing(tmp_path: Path) -> None:
     init_db(str(db_path))
 
     assert get_proxies(str(db_path)) == ["1.2.3.4:8080"]
+
+
+def run_record(
+    started_at: datetime,
+    contributions: tuple[SourceYield, ...] = (),
+) -> RunRecord:
+    return RunRecord(
+        started_at=started_at,
+        scraped=900,
+        candidates=500,
+        working=12,
+        unreachable=470,
+        rejected=18,
+        contributions=contributions,
+    )
+
+
+def test_a_recorded_run_comes_back_as_it_was_written(pool: Path) -> None:
+    record = run_record(
+        datetime(2026, 6, 1, 8, 0),
+        (SourceYield("geonode", 300, 5), SourceYield("github_raw_spys", 200, 7)),
+    )
+
+    record_run(record, str(pool))
+
+    assert read_runs(str(pool)) == (record,)
+
+
+def test_recorded_runs_come_back_in_the_order_they_happened(pool: Path) -> None:
+    second = run_record(datetime(2026, 6, 2, 8, 0))
+    first = run_record(datetime(2026, 6, 1, 8, 0))
+
+    record_run(second, str(pool))
+    record_run(first, str(pool))
+
+    assert [record.started_at for record in read_runs(str(pool))] == [
+        first.started_at,
+        second.started_at,
+    ]
+
+
+def test_a_run_that_read_no_source_records_no_contribution(pool: Path) -> None:
+    record = run_record(datetime(2026, 6, 1, 8, 0), ())
+
+    record_run(record, str(pool))
+
+    assert read_runs(str(pool))[0].contributions == ()
+
+
+def test_a_candidate_still_in_the_pool_is_a_working_spell_open(pool: Path) -> None:
+    probed("1.2.3.4:8080", pool)
+    started = started_working(pool, "1.2.3.4:8080")
+
+    assert read_lifetimes(str(pool)) == (
+        Lifetime("1.2.3.4:8080", datetime.fromisoformat(started), None),
+    )
+
+
+def test_a_candidate_that_worked_and_left_keeps_the_time_it_started(pool: Path) -> None:
+    probed("1.2.3.4:8080", pool)
+    started = started_working(pool, "1.2.3.4:8080")
+
+    for _ in range(STRIKE_LIMIT):
+        missed("1.2.3.4:8080", pool)
+
+    spell = read_lifetimes(str(pool))[0]
+
+    assert (spell.address, spell.started_at.isoformat()) == ("1.2.3.4:8080", started)
+    assert spell.ended_at is not None
+
+
+def test_a_candidate_nobody_ever_saw_work_leaves_nothing_to_measure(pool: Path) -> None:
+    """A candidate that never carried a request was never working, so the fact
+    that it left says nothing about how long working candidates last"""
+
+    for _ in range(STRIKE_LIMIT):
+        missed("1.2.3.4:8080", pool)
+
+    assert read_lifetimes(str(pool)) == ()
+
+
+def test_a_candidate_dropped_for_going_unprobed_keeps_its_starting_time(
+    pool: Path,
+) -> None:
+    """A candidate nobody measured for a week is out of the pool whatever its
+    strikes say, and how long it had been working still counts"""
+
+    probed("1.2.3.4:8080", pool)
+    started = started_working(pool, "1.2.3.4:8080")
+
+    assert drop_stale(datetime.now().isoformat(), str(pool)) == 1
+
+    spell = read_lifetimes(str(pool))[0]
+
+    assert (spell.address, spell.started_at.isoformat()) == ("1.2.3.4:8080", started)
+    assert spell.ended_at is not None
+
+
+def test_a_candidate_dropped_for_going_unprobed_before_it_ever_worked_is_ignored(
+    pool: Path,
+) -> None:
+    with closing(sqlite3.connect(pool)) as conn:
+        conn.execute("INSERT INTO proxies (address) VALUES (?)", ("1.2.3.4:8080",))
+        conn.commit()
+
+    drop_stale(ago(1), str(pool))
+
+    assert read_lifetimes(str(pool)) == ()
+
+
+def test_a_candidate_that_came_back_is_measured_from_the_second_time(
+    pool: Path,
+) -> None:
+    """A candidate that left and worked again had two working spells, and the
+    figure is about spells rather than addresses"""
+
+    probed("1.2.3.4:8080", pool)
+
+    for _ in range(STRIKE_LIMIT):
+        missed("1.2.3.4:8080", pool)
+
+    probed("1.2.3.4:8080", pool)
+
+    spells = read_lifetimes(str(pool))
+
+    assert len(spells) == 2
+    assert [spell.ended_at is None for spell in spells] == [False, True]
+    assert spells[0].started_at < spells[1].started_at
+
+
+def test_a_pool_written_before_the_tool_kept_working_spells_gains_that_table(
+    pool: Path,
+) -> None:
+    """The marker is what lets a pool that already exists pick up a new table, so
+    a pool out there is neither left without one nor thrown away for it"""
+
+    probed("1.2.3.4:8080", pool)
+
+    with closing(sqlite3.connect(pool)) as conn:
+        conn.execute("DROP TABLE deaths")
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version VALUES (?)", (SCHEMA_VERSION - 1,))
+        conn.commit()
+
+    init_db(str(pool))
+
+    assert schema_version(str(pool)) == SCHEMA_VERSION
+    assert get_proxies(str(pool)) == ["1.2.3.4:8080"]
+    assert [spell.address for spell in read_lifetimes(str(pool))] == ["1.2.3.4:8080"]
+
+
+def test_a_pool_written_before_there_was_any_history_reads_as_having_none(
+    pool: Path,
+) -> None:
+    """A pool an older build wrote has no deaths table to read, and asking it for
+    them is a question with the answer nothing rather than a failure"""
+
+    with closing(sqlite3.connect(pool)) as conn:
+        conn.execute("DROP TABLE deaths")
+        conn.commit()
+
+    assert read_runs(str(pool)) == ()
+    assert read_lifetimes(str(pool)) == ()

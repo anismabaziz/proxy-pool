@@ -4,6 +4,7 @@ import subprocess
 import sys
 from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from src.cli import (
     settings_from_args,
 )
 from src.logs import configure, level_for
+from src.report import HistoryReport
 from src.run import (
     Retention,
     RevalidationReport,
@@ -26,6 +28,7 @@ from src.run import (
     RunSettings,
     report_retention,
 )
+from src.storage import RunRecord, SourceYield
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -43,13 +46,13 @@ def normal_voice() -> Iterator[None]:
 class FakeRunner:
     """Runs no command, and records what the command line asked it to run"""
 
-    report: RunReport | RevalidationReport | None = None
+    report: RunReport | RevalidationReport | HistoryReport | None = None
     raise_on_run: BaseException | None = None
     asked: list[tuple[Command, RunSettings]] = field(default_factory=list)
 
     def __call__(
         self, command: Command, settings: RunSettings
-    ) -> RunReport | RevalidationReport:
+    ) -> RunReport | RevalidationReport | HistoryReport:
         self.asked.append((command, settings))
 
         if self.raise_on_run is not None:
@@ -340,3 +343,37 @@ def test_a_quiet_run_prints_nothing_a_normal_one_would(
     report_retention(Retention(working=[], evicted=0, stale=0))
 
     assert "POOL" not in capsys.readouterr().err
+
+
+def test_the_report_is_reachable_from_the_command_line(tmp_path: Path) -> None:
+    pool = tmp_path / "pool.db"
+    runner = FakeRunner()
+
+    assert main(["report", "--db", str(pool)], runner) == EXIT_OK
+    assert [command.__name__ for command, _ in runner.asked] == ["report"]
+
+
+def test_the_report_answers_on_stdout_so_it_can_be_redirected(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    history = HistoryReport(
+        runs=(
+            RunRecord(
+                started_at=datetime(2026, 6, 1, 8, 0),
+                scraped=300,
+                candidates=300,
+                working=18,
+                unreachable=280,
+                rejected=2,
+                contributions=(SourceYield("geonode", 300, 18),),
+            ),
+        ),
+        lifetimes=(),
+        roster=("geonode", "broken"),
+    )
+
+    main(["report"], FakeRunner(report=history))
+    out = capsys.readouterr().out
+
+    assert "| geonode | 1 | 300 | 18 | 6.0% | yielded |" in out
+    assert "| broken | 0 | 0 | 0 | — | never answered |" in out

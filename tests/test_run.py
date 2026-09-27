@@ -3,13 +3,14 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
 from src.capabilities import Outcome, Payload, ProbeOutcome
 from src.run import RunSettings, revalidate, run
 from src.sources import EmptySourceError, PayloadFormat, Source
-from src.storage import get_proxies, record_outcome
+from src.storage import get_proxies, read_runs, record_outcome
 
 
 @dataclass
@@ -347,3 +348,142 @@ async def test_an_unreachable_candidate_stays_out_of_the_pool(pool: Path) -> Non
 
 def test_the_default_validation_target_is_https() -> None:
     assert RunSettings().validation_target.startswith("https://")
+
+
+def ago(days: float) -> str:
+    return (datetime.now() - timedelta(days=days)).isoformat()
+
+
+async def test_a_run_records_when_it_happened_and_what_it_found(pool: Path) -> None:
+    fetcher = FakeFetcher(
+        {
+            "first": "1.1.1.1:80\n2.2.2.2:80",
+            "second": "3.3.3.3:80",
+        }
+    )
+    probe = FakeProbe(
+        working={"2.2.2.2:80"}, otherwise={"1.1.1.1:80": Outcome.REJECTED}
+    )
+
+    started_before = datetime.now()
+    await run(run_settings(sources(), pool), fetcher, probe)
+    record = read_runs(str(pool))[0]
+
+    assert started_before <= record.started_at <= datetime.now()
+    assert (record.scraped, record.candidates) == (3, 3)
+    assert (record.working, record.unreachable, record.rejected) == (1, 1, 1)
+
+
+async def test_a_run_records_what_each_source_contributed(pool: Path) -> None:
+    fetcher = FakeFetcher(
+        {
+            "first": "1.1.1.1:80\n2.2.2.2:80",
+            "second": "2.2.2.2:80\n3.3.3.3:80",
+        }
+    )
+
+    await run(
+        run_settings(sources(), pool),
+        fetcher,
+        FakeProbe(working={"2.2.2.2:80"}),
+    )
+    record = read_runs(str(pool))[0]
+
+    # the candidate two sources offered is counted once, against the source that
+    # got there first, so what the sources add up to is what the run measured
+    assert [(c.source, c.candidates, c.working) for c in record.contributions] == [
+        ("first", 1, 0),
+        ("second", 2, 1),
+    ]
+    assert sum(c.candidates for c in record.contributions) == record.candidates
+
+
+async def test_a_run_whose_chunks_were_all_lost_records_no_outcome(pool: Path) -> None:
+    """A chunk that blew up says nothing about the candidates in it, so the run
+    records them as taken on and measured nowhere rather than as misses"""
+
+    class ExplodingProbe(FakeProbe):
+        async def probe(self, candidate: str) -> ProbeOutcome:
+            self.asked.append(candidate)
+            raise RuntimeError("connection reset")
+
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "2.2.2.2:80"})
+
+    await run(run_settings(sources(), pool), fetcher, ExplodingProbe(working=set()))
+    record = read_runs(str(pool))[0]
+
+    assert (record.candidates, record.working, record.unreachable) == (2, 0, 0)
+
+
+async def test_a_run_that_never_finished_records_nothing(pool: Path) -> None:
+    """A run that failed has no finding to keep: half a run is not a run, and
+    recording it as one would put a row in the history that never happened"""
+
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "no addresses in here"})
+
+    with pytest.raises(EmptySourceError):
+        await run(run_settings(sources(), pool), fetcher, FakeProbe(working=set()))
+
+    assert read_runs(str(pool)) == ()
+
+
+async def test_a_revalidation_records_what_it_found(pool: Path) -> None:
+    stored(pool, "1.1.1.1:80", "2.2.2.2:80")
+
+    await revalidate(run_settings(sources(), pool), FakeProbe(working={"1.1.1.1:80"}))
+    record = read_runs(str(pool))[0]
+
+    assert (record.scraped, record.candidates) == (0, 2)
+    assert (record.working, record.unreachable, record.rejected) == (1, 1, 0)
+    assert record.contributions == ()
+
+
+async def test_a_revalidation_does_not_measure_candidates_it_no_longer_trusts(
+    pool: Path,
+) -> None:
+    """A candidate no recent run probed is not data, so it is dropped before the
+    run rather than counted in what the run found"""
+
+    stored(pool, "1.1.1.1:80")
+
+    with closing(sqlite3.connect(pool)) as conn:
+        conn.execute("UPDATE proxies SET last_probed_at = ?", (ago(30),))
+        conn.commit()
+
+    report = await revalidate(run_settings(sources(), pool), FakeProbe(working=set()))
+    record = read_runs(str(pool))[0]
+
+    assert (record.candidates, record.working) == (0, 0)
+    assert report.stale == 1
+    assert get_proxies(str(pool)) == []
+
+
+async def test_a_source_whose_candidates_were_all_duplicates_is_still_named(
+    pool: Path,
+) -> None:
+    """A source that answered with nothing of its own has still answered, and the
+    report has to be able to tell that apart from a source that stayed silent"""
+
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "1.1.1.1:80\n2.2.2.2:80"})
+
+    await run(
+        run_settings(sources(), pool),
+        fetcher,
+        FakeProbe(working={"1.1.1.1:80"}),
+    )
+    record = read_runs(str(pool))[0]
+
+    assert [(c.source, c.candidates, c.working) for c in record.contributions] == [
+        ("first", 1, 1),
+        ("second", 1, 0),
+    ]
+
+
+async def test_every_run_adds_its_own_row_to_the_history(pool: Path) -> None:
+    settings = run_settings(sources(), pool)
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "2.2.2.2:80"})
+
+    await run(settings, fetcher, FakeProbe(working={"1.1.1.1:80"}))
+    await revalidate(settings, FakeProbe(working={"1.1.1.1:80"}))
+
+    assert [record.candidates for record in read_runs(str(pool))] == [2, 1]

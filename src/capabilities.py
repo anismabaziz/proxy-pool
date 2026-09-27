@@ -34,15 +34,6 @@ class ProbeOutcome:
     def is_working(self) -> bool:
         return self.state is Outcome.WORKING
 
-    def as_pair(self) -> tuple[str, int] | None:
-        """The address and latency a working probe contributes to the pool, or
-        nothing at all, since a probe that did not work never had a latency"""
-
-        if self.state is not Outcome.WORKING or self.latency_ms is None:
-            return None
-
-        return (self.proxy, self.latency_ms)
-
 
 class Fetcher(Protocol):
     async def fetch(self, source: Source) -> Payload: ...

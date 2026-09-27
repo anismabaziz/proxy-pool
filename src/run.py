@@ -1,17 +1,18 @@
 import asyncio
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
+from datetime import datetime
 from itertools import zip_longest
 
 from src.capabilities import Fetcher, ProbeOutcome, Prober
 from src.sources import SOURCES, Source
 from src.storage import (
     DEFAULT_DB_PATH,
+    drop_stale,
     get_proxies,
     init_db,
-    remove_proxies,
-    save_working_proxies,
-    update_proxies,
+    record_outcome,
+    stale_before,
 )
 
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
@@ -61,6 +62,8 @@ class RunReport:
     contributions: tuple[SourceContribution, ...] = ()
     working: list[ProbeOutcome] = field(default_factory=list)
     saved: int = 0
+    evicted: int = 0
+    stale: int = 0
 
 
 @dataclass
@@ -70,14 +73,45 @@ class RevalidationReport:
     candidates: int
     failed_chunks: int
     updated: int
-    removed: int
+    evicted: int
+    stale: int
     working: list[ProbeOutcome] = field(default_factory=list)
 
 
-def addresses(outcomes: Sequence[ProbeOutcome]) -> list[tuple[str, int]]:
-    """The "ip:port, latency" pairs storage keeps, one per working outcome"""
+@dataclass(frozen=True)
+class Retention:
+    """What the pool's own rules did to a run's outcomes"""
 
-    return [pair for outcome in outcomes if (pair := outcome.as_pair()) is not None]
+    working: list[ProbeOutcome]
+    evicted: int
+    stale: int
+
+
+def apply_retention(outcomes: Sequence[ProbeOutcome], db_path: str) -> Retention:
+    """Fold every probe result into the pool, then drop whatever no recent run
+    probed. A candidate the pool carries but nobody has measured is not data,
+    and a candidate that has missed three times running has been"""
+
+    working = [outcome for outcome in outcomes if outcome.is_working]
+    evicted = 0
+
+    for outcome in outcomes:
+        if record_outcome(outcome, db_path):
+            evicted += 1
+
+    return Retention(
+        working=working,
+        evicted=evicted,
+        stale=drop_stale(stale_before(datetime.now()), db_path),
+    )
+
+
+def report_retention(retention: Retention) -> None:
+    """What the pool's rules did, in the words a run uses to describe itself"""
+
+    print(f"[POOL] Working: {len(retention.working)}")
+    print(f"[POOL] Left on three strikes: {retention.evicted}")
+    print(f"[POOL] Left unprobed: {retention.stale}")
 
 
 def chunks(candidates: Sequence[str], size: int) -> Iterable[Sequence[str]]:
@@ -120,9 +154,11 @@ async def probe_in_chunks(
     settings: RunSettings,
     label: str,
 ) -> tuple[list[ProbeOutcome], int]:
-    """Probe candidates in chunks, pausing between chunks and surviving a bad one"""
+    """Probe candidates in chunks, pausing between chunks and surviving a bad
+    one, and hand back every outcome, since what did not work is what retention
+    has to reason about"""
 
-    working: list[ProbeOutcome] = []
+    outcomes: list[ProbeOutcome] = []
     failed_chunks = 0
 
     for index, chunk in enumerate(chunks(candidates, settings.chunk_size)):
@@ -131,18 +167,18 @@ async def probe_in_chunks(
         )
 
         try:
-            outcomes = await asyncio.gather(*(prober.probe(c) for c in chunk))
+            chunk_outcomes = await asyncio.gather(*(prober.probe(c) for c in chunk))
         except Exception as e:
             print(f"[ERROR] Chunk failed: {e}")
             failed_chunks += 1
             await asyncio.sleep(settings.failure_delay)
             continue
 
-        chunk_working = [outcome for outcome in outcomes if outcome.is_working]
-        working.extend(chunk_working)
-        print(f"[{label}] Chunk {index + 1}: Working {len(chunk_working)}")
+        outcomes.extend(chunk_outcomes)
+        working = sum(1 for outcome in chunk_outcomes if outcome.is_working)
+        print(f"[{label}] Chunk {index + 1}: Working {working}")
 
-    return working, failed_chunks
+    return outcomes, failed_chunks
 
 
 async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunReport:
@@ -156,13 +192,13 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
     print(f"[RAW] Total unique candidates scraped: {len(unique)}")
 
     candidates = unique[: settings.max_candidates]
-    working, failed_chunks = await probe_in_chunks(
+    outcomes, failed_chunks = await probe_in_chunks(
         prober, candidates, settings, "VALID"
     )
+    retention = apply_retention(outcomes, settings.db_path)
+    report_retention(retention)
 
-    save_working_proxies(addresses(working), settings.db_path)
-    print(f"\n[DB] Saved proxies to db: {len(working)}")
-    print(f"\n[FINISH] Working proxies: {len(working)}")
+    print(f"[FINISH] Probed {len(candidates)} candidates")
 
     return RunReport(
         scraped=len(unique),
@@ -177,34 +213,35 @@ async def run(settings: RunSettings, fetcher: Fetcher, prober: Prober) -> RunRep
             )
             for source, found in scraped
         ),
-        working=working,
-        saved=len(working),
+        working=retention.working,
+        saved=len(retention.working),
+        evicted=retention.evicted,
+        stale=retention.stale,
     )
 
 
 async def revalidate(settings: RunSettings, prober: Prober) -> RevalidationReport:
-    """Probe the stored proxies again, refresh the ones that work, drop the rest"""
+    """Probe the stored proxies again, and let each one in or out of the pool
+    according to what the probe found"""
+
+    init_db(settings.db_path)
 
     stored = get_proxies(settings.db_path)
     print(f"[START] Proxy list: {len(stored)} proxies")
 
-    working, failed_chunks = await probe_in_chunks(
+    outcomes, failed_chunks = await probe_in_chunks(
         prober, stored, settings, "REVALIDATE"
     )
+    retention = apply_retention(outcomes, settings.db_path)
+    report_retention(retention)
 
-    targets = addresses(working)
-    _, updated, last_checked = update_proxies(targets, settings.db_path)
-    print(f"[DB] Updated working proxies: {updated}")
-
-    _, removed = remove_proxies(last_checked, settings.db_path)
-    print(f"[DB] Removed dead proxies: {removed}")
-
-    print(f"[FINISH] Working proxies: {len(targets)}")
+    print(f"[FINISH] Revalidated {len(stored)} candidates")
 
     return RevalidationReport(
         candidates=len(stored),
         failed_chunks=failed_chunks,
-        updated=updated,
-        removed=removed,
-        working=working,
+        updated=len(retention.working),
+        evicted=retention.evicted,
+        stale=retention.stale,
+        working=retention.working,
     )

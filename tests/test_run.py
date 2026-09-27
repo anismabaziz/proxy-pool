@@ -1,5 +1,6 @@
 import json
-from collections.abc import Iterator
+import sqlite3
+from contextlib import closing
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -7,7 +8,7 @@ import pytest
 from src.capabilities import Outcome, Payload, ProbeOutcome
 from src.run import RunSettings, revalidate, run
 from src.sources import EmptySourceError, PayloadFormat, Source
-from src.storage import get_proxies, init_db, save_working_proxies
+from src.storage import get_proxies, record_outcome
 
 
 @dataclass
@@ -42,25 +43,18 @@ class FakeProbe:
         )
 
 
-def run_settings(sources: tuple[Source, ...]) -> RunSettings:
+def run_settings(sources: tuple[Source, ...], pool: Path) -> RunSettings:
     """The same settings a real run uses, minus the wait between chunks"""
 
     return RunSettings(
         sources=sources,
-        db_path="proxies.db",
+        db_path=str(pool),
         max_candidates=1000,
         chunk_size=2,
         chunk_delay_base=0,
         chunk_delay_step=0,
         failure_delay=0,
     )
-
-
-@pytest.fixture
-def pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    monkeypatch.chdir(tmp_path)
-    init_db("proxies.db")
-    yield tmp_path / "proxies.db"
 
 
 def text_source(name: str) -> Source:
@@ -74,7 +68,7 @@ def sources() -> tuple[Source, ...]:
 async def test_every_source_is_fetched(pool: Path) -> None:
     fetcher = FakeFetcher({"first": "1.1.1.1:80\n2.2.2.2:80", "second": "3.3.3.3:80"})
 
-    await run(run_settings(sources()), fetcher, FakeProbe(working=set()))
+    await run(run_settings(sources(), pool), fetcher, FakeProbe(working=set()))
 
     assert sorted(fetcher.asked) == ["first", "second"]
 
@@ -88,7 +82,7 @@ async def test_only_candidates_reaching_the_probe_are_probed(pool: Path) -> None
     )
     probe = FakeProbe(working={"1.1.1.1:80"})
 
-    report = await run(run_settings(sources()), fetcher, probe)
+    report = await run(run_settings(sources(), pool), fetcher, probe)
 
     assert sorted(probe.asked) == ["1.1.1.1:80", "2.2.2.2:80", "3.3.3.3:80"]
     assert report.scraped == 3
@@ -100,7 +94,7 @@ async def test_duplicates_across_sources_are_probed_once(pool: Path) -> None:
     fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "1.1.1.1:80"})
     probe = FakeProbe(working=set())
 
-    await run(run_settings(sources()), fetcher, probe)
+    await run(run_settings(sources(), pool), fetcher, probe)
 
     assert probe.asked == ["1.1.1.1:80"]
 
@@ -119,7 +113,7 @@ async def test_a_probe_failure_costs_the_whole_chunk(pool: Path) -> None:
     )
     probe = ExplodingProbe(working=set())
 
-    report = await run(run_settings(sources()), fetcher, probe)
+    report = await run(run_settings(sources(), pool), fetcher, probe)
 
     assert report.failed_chunks == 1
     assert report.working == []
@@ -134,25 +128,90 @@ async def test_working_proxies_are_saved(pool: Path) -> None:
     )
 
     report = await run(
-        run_settings(sources()), fetcher, FakeProbe(working={"1.1.1.1:80"})
+        run_settings(sources(), pool), fetcher, FakeProbe(working={"1.1.1.1:80"})
     )
 
     assert [(w.proxy, w.latency_ms) for w in report.working] == [("1.1.1.1:80", 100)]
     assert report.saved == 1
-    assert get_proxies() == ["1.1.1.1:80"]
+    assert get_proxies(str(pool)) == ["1.1.1.1:80"]
 
 
-async def test_revalidation_drops_the_proxies_that_stopped_working(pool: Path) -> None:
-    save_working_proxies([("1.1.1.1:80", 120), ("2.2.2.2:80", 340)])
+def stored(pool: Path, *addresses: str) -> None:
+    """A pool holding candidates that have all worked at least once"""
+
+    for address in addresses:
+        record_outcome(ProbeOutcome(address, Outcome.WORKING, 120), str(pool))
+
+
+async def test_revalidation_keeps_a_candidate_that_missed_once(pool: Path) -> None:
+    stored(pool, "1.1.1.1:80", "2.2.2.2:80")
 
     report = await revalidate(
-        run_settings(sources()), FakeProbe(working={"1.1.1.1:80"})
+        run_settings(sources(), pool), FakeProbe(working={"1.1.1.1:80"})
     )
 
     assert report.candidates == 2
     assert report.updated == 1
-    assert report.removed == 1
-    assert get_proxies() == ["1.1.1.1:80"]
+    assert report.evicted == 0
+    assert sorted(get_proxies(str(pool))) == ["1.1.1.1:80", "2.2.2.2:80"]
+
+
+async def test_revalidation_keeps_a_candidate_the_target_refuses(pool: Path) -> None:
+    stored(pool, "1.1.1.1:80", "2.2.2.2:80")
+
+    probe = FakeProbe(
+        working={"1.1.1.1:80"}, otherwise={"2.2.2.2:80": Outcome.REJECTED}
+    )
+    report = await revalidate(run_settings(sources(), pool), probe)
+
+    assert report.evicted == 0
+    assert sorted(get_proxies(str(pool))) == ["1.1.1.1:80", "2.2.2.2:80"]
+
+
+async def test_revalidation_evicts_a_candidate_on_its_third_miss(pool: Path) -> None:
+    stored(pool, "1.1.1.1:80", "2.2.2.2:80")
+    settings = run_settings(sources(), pool)
+    gone = FakeProbe(working=set())
+    staying = FakeProbe(working={"2.2.2.2:80"})
+
+    await revalidate(settings, gone)
+    await revalidate(settings, gone)
+    assert sorted(get_proxies(str(pool))) == ["1.1.1.1:80", "2.2.2.2:80"]
+
+    report = await revalidate(settings, staying)
+
+    assert report.evicted == 1
+    assert get_proxies(str(pool)) == ["2.2.2.2:80"]
+
+
+async def test_a_candidate_working_again_starts_its_strikes_over(pool: Path) -> None:
+    stored(pool, "1.1.1.1:80")
+    settings = run_settings(sources(), pool)
+    gone = FakeProbe(working=set())
+
+    await revalidate(settings, gone)
+    await revalidate(settings, gone)
+    await revalidate(settings, FakeProbe(working={"1.1.1.1:80"}))
+
+    await revalidate(settings, gone)
+    await revalidate(settings, gone)
+
+    assert get_proxies(str(pool)) == ["1.1.1.1:80"]
+
+
+async def test_a_run_drops_a_candidate_it_never_probed(pool: Path) -> None:
+    with closing(sqlite3.connect(pool)) as conn:
+        conn.execute("INSERT INTO proxies (address) VALUES (?)", ("9.9.9.9:80",))
+        conn.commit()
+
+    fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "2.2.2.2:80"})
+
+    report = await run(
+        run_settings(sources(), pool), fetcher, FakeProbe(working={"1.1.1.1:80"})
+    )
+
+    assert report.stale == 1
+    assert get_proxies(str(pool)) == ["1.1.1.1:80"]
 
 
 GEONODE_PAYLOAD = json.dumps(
@@ -173,7 +232,7 @@ async def test_a_json_source_offers_the_addresses_it_splits_into_fields(
     fetcher = FakeFetcher({"geonode": GEONODE_PAYLOAD})
     probe = FakeProbe(working=set())
 
-    report = await run(run_settings((source,)), fetcher, probe)
+    report = await run(run_settings((source,), pool), fetcher, probe)
 
     assert sorted(probe.asked) == ["1.1.1.1:8080", "2.2.2.2:3128"]
     assert report.scraped == 2
@@ -183,7 +242,7 @@ async def test_a_source_that_offers_nothing_is_an_error(pool: Path) -> None:
     fetcher = FakeFetcher({"first": "1.1.1.1:80", "second": "no addresses in here"})
 
     with pytest.raises(EmptySourceError, match="second"):
-        await run(run_settings(sources()), fetcher, FakeProbe(working=set()))
+        await run(run_settings(sources(), pool), fetcher, FakeProbe(working=set()))
 
 
 async def test_a_json_source_without_entries_is_an_error(pool: Path) -> None:
@@ -191,7 +250,7 @@ async def test_a_json_source_without_entries_is_an_error(pool: Path) -> None:
     fetcher = FakeFetcher({"geonode": json.dumps({"data": []})})
 
     with pytest.raises(EmptySourceError, match="geonode"):
-        await run(run_settings((source,)), fetcher, FakeProbe(working=set()))
+        await run(run_settings((source,), pool), fetcher, FakeProbe(working=set()))
 
 
 async def test_a_json_source_answering_with_an_error_page_is_an_error(
@@ -201,7 +260,7 @@ async def test_a_json_source_answering_with_an_error_page_is_an_error(
     fetcher = FakeFetcher({"geonode": "<html><body>502 Bad Gateway</body></html>"})
 
     with pytest.raises(EmptySourceError, match="geonode"):
-        await run(run_settings((source,)), fetcher, FakeProbe(working=set()))
+        await run(run_settings((source,), pool), fetcher, FakeProbe(working=set()))
 
 
 async def test_a_run_reports_what_each_source_contributed(pool: Path) -> None:
@@ -212,7 +271,7 @@ async def test_a_run_reports_what_each_source_contributed(pool: Path) -> None:
         }
     )
 
-    report = await run(run_settings(sources()), fetcher, FakeProbe(working=set()))
+    report = await run(run_settings(sources(), pool), fetcher, FakeProbe(working=set()))
 
     assert [(c.source, c.candidates) for c in report.contributions] == [
         ("first", 2),
@@ -230,7 +289,7 @@ async def test_a_long_source_cannot_crowd_out_a_short_one(pool: Path) -> None:
     probe = FakeProbe(working=set())
     settings = RunSettings(
         sources=sources(),
-        db_path="proxies.db",
+        db_path=str(pool),
         max_candidates=2,
         chunk_size=10,
         chunk_delay_base=0,
@@ -251,10 +310,10 @@ async def test_a_candidate_answering_with_the_wrong_body_stays_out_of_the_pool(
         working={"2.2.2.2:80"}, otherwise={"1.1.1.1:80": Outcome.REJECTED}
     )
 
-    report = await run(run_settings(sources()), fetcher, probe)
+    report = await run(run_settings(sources(), pool), fetcher, probe)
 
     assert [outcome.proxy for outcome in report.working] == ["2.2.2.2:80"]
-    assert get_proxies() == ["2.2.2.2:80"]
+    assert get_proxies(str(pool)) == ["2.2.2.2:80"]
 
 
 async def test_an_unreachable_candidate_stays_out_of_the_pool(pool: Path) -> None:
@@ -263,10 +322,10 @@ async def test_an_unreachable_candidate_stays_out_of_the_pool(pool: Path) -> Non
         working={"2.2.2.2:80"}, otherwise={"1.1.1.1:80": Outcome.UNREACHABLE}
     )
 
-    report = await run(run_settings(sources()), fetcher, probe)
+    report = await run(run_settings(sources(), pool), fetcher, probe)
 
     assert [outcome.proxy for outcome in report.working] == ["2.2.2.2:80"]
-    assert get_proxies() == ["2.2.2.2:80"]
+    assert get_proxies(str(pool)) == ["2.2.2.2:80"]
 
 
 def test_the_default_validation_target_is_https() -> None:

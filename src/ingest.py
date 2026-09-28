@@ -1,52 +1,36 @@
 import asyncio
+
 import aiohttp
-from typing import List
-import re
 
 
+async def request(
+    session: aiohttp.ClientSession,
+    url: str,
+    user_agent: str,
+    timeout_s: float,
+    attempts: int,
+    backoff_s: float,
+) -> str:
+    """Get the text at url, retrying as many times as we are given before giving
+    up on it"""
 
-async def fetch(session: aiohttp.ClientSession, url : str) -> str:
-  """ Fetch html from url with retry logic """
+    headers = {"User-Agent": user_agent}
 
-  headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    for attempt in range(attempts):
+        try:
+            async with session.get(
+                url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout_s)
+            ) as resp:
+                if resp.status == 200:
+                    return await resp.text()
+        except Exception:
+            # a source that dropped the connection is worth another attempt, and
+            # what it dropped us is of no use now that we are about to try again
+            pass
 
-  # at each attempt we try to get the url html if there is any problem we stop 
-  # sleep time is exponential
-  for attemps in range(3):
-    try:
-      async with session.get(url, headers=headers, timeout=10) as resp:
-        if resp.status == 200:
-          return await resp.text()
-        else:
-          return await asyncio.sleep(1)
-    except:
-      await asyncio.sleep(2 ** attemps)
+        if attempt < attempts - 1:
+            # an unsuccessful response or a dropped one: pause before trying
+            # again, longer each time, with the response already closed
+            await asyncio.sleep(backoff_s * 2**attempt)
 
-  return ""
-
-
-
-async def extract(html: str, source_name: str) -> List[str]:
-  """ Extract IP:PORT pattern from html or raw text """
-
-  patterns = [
-    r'\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{2,5}\b',
-    r'(\d+\.\d+\.\d+\.\d+):(\d+)'
-  ]
-
-  matches = re.findall(patterns[0], html)
-
-  # dedupe
-  return list(set(matches))
-
-
-async def scrape_source(session: aiohttp.ClientSession, url: str, name: str) -> List[str]:
-  """ Main scraping function """
-  html = await fetch(session, url)
-  if not html:
-    return []
-  
-  proxies = await extract(html, url)
-  print(f"[✓] {name}: found {len(proxies)} proxies")
-
-  return proxies
+    return ""
